@@ -1,6 +1,6 @@
 ITEM.name = "Digilock"
 ITEM.description = "A digital locking system that secures an entire doorway electronically."
-ITEM.model = "models/props_lab/keypad.mdl"
+ITEM.model = "models/card_reader/card_reader.mdl"
 ITEM.width = 1
 ITEM.height = 1
 ITEM.category = "Security"
@@ -210,5 +210,6 @@ ITEM.functions.UndoLastSelection = {
         return false
     end
 }
+
 
 

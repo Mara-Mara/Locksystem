@@ -4004,18 +4004,13 @@ function PLUGIN:SaveDoorStateForLock(lockID, doorThatChanged)
                 -- This is a fallback - we'll check the door's current position
                 -- Most doors rotate or move when opening, so we can compare positions
                 -- However, this requires knowing the closed position, which we might not have
-                -- For now, if we can't determine, we'll log it and default to closed
-                print("[ixDoorLocks] Warning: Could not determine door state for door " .. tostring(referenceDoor:EntIndex()) .. " (lockID: " .. tostring(lockID) .. ")")
-                print("[ixDoorLocks] Door entity: " .. tostring(referenceDoor))
-                print("[ixDoorLocks] Door class: " .. tostring(referenceDoor:GetClass()))
-                -- Default to closed if we can't determine (safer than assuming open)
+                -- For now, if we can't determine, default to closed
                 isOpen = false
             end
         end
     end
     
     local targetState = isOpen and "open" or "close"
-    print("[ixDoorLocks] Saving door state for lock " .. tostring(lockID) .. ": " .. targetState .. " (doorState var: " .. tostring(doorState) .. ")")
     
     -- Save the same state for all doors in the lock (for restoration on restart/load)
     -- This ensures all doors in a lock group will restore to the same state

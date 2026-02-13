@@ -33,6 +33,15 @@ if (SERVER) then
     util.AddNetworkString("ixDoorLocks_SetGroupCode")
     util.AddNetworkString("ixDoorLocks_ClearGroupCode")
     util.AddNetworkString("ixDoorLocks_ViewGroupLocks")
+    util.AddNetworkString("ixDoorLocks_GroupManagementData")
+    util.AddNetworkString("ixDoorLocks_SubmitOverrideCode")
+    util.AddNetworkString("ixDoorLocks_ChangePersonalOverrideCode")
+    util.AddNetworkString("ixDoorLocks_ChangeGroupOverrideCode")
+    util.AddNetworkString("ixDoorLocks_ToggleOverrideMode")
+    util.AddNetworkString("ixDoorLocks_OpenCodeEntry")
+    util.AddNetworkString("ixDoorLocks_OpenOverrideCodeEntry")
+    util.AddNetworkString("ixDoorLocks_ToggleAutolock")
+    util.AddNetworkString("ixDoorLocks_ToggleRetainDoorState")
 end
 
 PLUGIN.lockTypes = {
@@ -64,7 +73,7 @@ PLUGIN.placementSessions = PLUGIN.placementSessions or {}
 PLUGIN.config = PLUGIN.config or {}
 
 PLUGIN.config.deadlockMaxHealth = PLUGIN.config.deadlockMaxHealth or 100
-PLUGIN.config.maxKeycardsPerLock = PLUGIN.config.maxKeycardsPerLock or 10
+-- maxKeycardsPerLock is now configured via ix.config.Get("maxKeycardsPerLock", 10)
 PLUGIN.config.maxBiometricUsers = PLUGIN.config.maxBiometricUsers or 16
 PLUGIN.config.pairingDuration = PLUGIN.config.pairingDuration or 30 -- seconds
 PLUGIN.config.allowAnyoneToLock = PLUGIN.config.allowAnyoneToLock or false
@@ -270,13 +279,56 @@ function PLUGIN:ApplyLockState(lockID)
     -- Support multiple doors: apply state to all doors
     local doorIDs = data.doorIDs or {data.doorID} -- Backward compatibility
     
+    -- Check if we should restore door state (retainDoorState setting)
+    local retainDoorState = data.retainDoorState == true
+    
     for _, doorID in ipairs(doorIDs) do
         local door = self:GetDoorFromID(doorID)
         if (IsValid(door)) then
-            if (data.isLocked) then
-                self:LockDoorEntity(door, lockID)
+            -- Restore door open/closed state if retainDoorState is enabled
+            -- This must be done BEFORE locking, because locked doors can't be opened
+            if (retainDoorState and data.doorStates and data.doorStates[doorID]) then
+                local savedState = data.doorStates[doorID]
+                if (savedState == "open") then
+                    -- If door needs to be open but will be locked, we need to unlock first
+                    -- Then open it, then lock it again
+                    if (data.isLocked) then
+                        -- Temporarily unlock to allow opening
+                        door:Fire("unlock")
+                        -- Use a small delay to ensure unlock completes before opening
+                        timer.Simple(0.1, function()
+                            if (IsValid(door)) then
+                                door:Fire("open")
+                                -- Lock it again after opening
+                                timer.Simple(0.2, function()
+                                    if (IsValid(door)) then
+                                        self:LockDoorEntity(door, lockID)
+                                    end
+                                end)
+                            end
+                        end)
+                    else
+                        -- Door is unlocked, just open it
+                        door:Fire("open")
+                    end
+                elseif (savedState == "close") then
+                    -- Door should be closed - close it first, then lock if needed
+                    door:Fire("close")
+                    if (data.isLocked) then
+                        timer.Simple(0.1, function()
+                            if (IsValid(door)) then
+                                self:LockDoorEntity(door, lockID)
+                            end
+                        end)
+                    end
+                end
             else
-                self:UnlockDoorEntity(door, lockID)
+                -- No state to restore, just apply lock state normally
+                if (data.isLocked) then
+                    self:LockDoorEntity(door, lockID)
+                else
+                    self:UnlockDoorEntity(door, lockID)
+                end
             end
         end
     end
@@ -285,6 +337,10 @@ function PLUGIN:ApplyLockState(lockID)
     if (data.type == self.lockTypes.DEADLOCK and not data.wasDestroyed) then
         self:EnsureDeadlockEntity(lockID)
     end
+    
+    -- Note: We do NOT save door state when lock state changes
+    -- Door state should only be saved when the player actually opens/closes the door
+    -- Saving after lock/unlock would overwrite the correct state with potentially wrong state
 end
 
 function PLUGIN:ApplyAllLocks()
@@ -384,6 +440,30 @@ function PLUGIN:CreateLock(client, door, lockType, mode, options)
     elseif (mode == self.lockModes.KEYCARD) then
         lockData.keycards = options.keycards or {}
         lockData.nextSerialNumber = 1 -- Linear serial number counter
+        
+        -- Handle override codes
+        if (options.overrideCodeHash) then
+            lockData.overrideCodeHash = options.overrideCodeHash
+            
+            -- If setGroupOverride is true, set group override code for all locks in the group
+            if (options.setGroupOverride and lockData.groupCode and lockData.groupCode ~= "") then
+                local groupLocks = self:GetAllGroupLocks(lockData)
+                for _, groupLock in ipairs(groupLocks) do
+                    if (groupLock.mode == self.lockModes.KEYCARD) then
+                        groupLock.groupOverrideCodeHash = options.overrideCodeHash
+                    end
+                end
+            end
+            
+            -- If setGroupOverride is true but no group code yet, we'll set it when group code is set
+            -- Store the flag for later
+            if (options.setGroupOverride) then
+                lockData.pendingGroupOverride = options.overrideCodeHash
+            end
+        end
+        
+        -- Set override mode enabled flag (defaults to true if override codes exist)
+        lockData.overrideModeEnabled = true
     elseif (mode == self.lockModes.BIOMETRIC) then
         if (lockData.installedByCharID) then
             lockData.authorizedBiometric[lockData.installedByCharID] = true
@@ -408,6 +488,18 @@ function PLUGIN:CreateLock(client, door, lockType, mode, options)
     end
 
     self:RegisterLock(lockData)
+
+    -- For keycard locks, check if there's a group override code to inherit
+    if (mode == self.lockModes.KEYCARD and not lockData.overrideCodeHash) then
+        -- Check if there's a group override code to inherit
+        local groupLocks = self:GetAllGroupLocks(lockData)
+        for _, groupLock in ipairs(groupLocks) do
+            if (groupLock ~= lockData and groupLock.mode == self.lockModes.KEYCARD and groupLock.groupOverrideCodeHash) then
+                lockData.groupOverrideCodeHash = groupLock.groupOverrideCodeHash
+                break
+            end
+        end
+    end
 
     -- Apply initial state and ensure entities.
     self:ApplyLockState(lockID)
@@ -437,6 +529,9 @@ function PLUGIN:SetLockState(lockID, bLocked)
     end
     
     -- Auto-relock timer (only one timer per lock, not per door)
+    -- Check autolock setting (defaults to true if not set)
+    local autolockEnabled = data.autolockEnabled ~= false
+    
     if (data.isLocked) then
         -- Cancel auto-relock timer if locking
         if (data.autoRelockTimer) then
@@ -444,16 +539,24 @@ function PLUGIN:SetLockState(lockID, bLocked)
             data.autoRelockTimer = nil
         end
     else
-        -- Auto-relock after 60 seconds
-        if (data.autoRelockTimer) then
-            timer.Remove(data.autoRelockTimer)
-        end
-        data.autoRelockTimer = "ixDoorLocks_AutoRelock_" .. lockID
-        timer.Create(data.autoRelockTimer, 60, 1, function()
-            if (not ix.shuttingDown and data and not data.isLocked) then
-                PLUGIN:SetLockState(lockID, true)
+        -- Auto-relock after 60 seconds (only if autolock is enabled)
+        if (autolockEnabled) then
+            if (data.autoRelockTimer) then
+                timer.Remove(data.autoRelockTimer)
             end
-        end)
+            data.autoRelockTimer = "ixDoorLocks_AutoRelock_" .. lockID
+            timer.Create(data.autoRelockTimer, 60, 1, function()
+                if (not ix.shuttingDown and data and not data.isLocked) then
+                    PLUGIN:SetLockState(lockID, true)
+                end
+            end)
+        else
+            -- Autolock disabled, remove any existing timer
+            if (data.autoRelockTimer) then
+                timer.Remove(data.autoRelockTimer)
+                data.autoRelockTimer = nil
+            end
+        end
     end
 
     self:SaveData()
@@ -546,6 +649,16 @@ function PLUGIN:SaveData()
             doorLocalPos = data.doorLocalPos,
             doorLocalAng = data.doorLocalAng,
             groupCode = data.groupCode, -- Group code for linking locks
+            
+            -- Lock settings
+            autolockEnabled = data.autolockEnabled,
+            retainDoorState = data.retainDoorState,
+            doorStates = data.doorStates, -- Saved door open/close states
+            
+            -- Override code settings (for keycard locks)
+            overrideCodeHash = data.overrideCodeHash,
+            groupOverrideCodeHash = data.groupOverrideCodeHash,
+            overrideModeEnabled = data.overrideModeEnabled,
         }
     end
 
@@ -787,6 +900,7 @@ net.Receive("ixDoorLocks_ConfirmPlacement", function(_, client)
     local itemID = net.ReadUInt(32)
     local userCode = net.ReadString() or ""
     local masterCode = net.ReadString() or ""
+    local overrideCode = net.ReadString() or ""
     local hasTraceData = net.ReadBool()
     local traceHitPos = hasTraceData and net.ReadVector() or nil
     local traceHitNormal = hasTraceData and net.ReadVector() or nil
@@ -854,6 +968,28 @@ net.Receive("ixDoorLocks_ConfirmPlacement", function(_, client)
         if (masterCode and masterCode ~= "") then
             options.managerCodeHash = PLUGIN:HashCode(masterCode)
         end
+    elseif (mode == PLUGIN.lockModes.KEYCARD) then
+        -- Check for blank keycard if required
+        if (ix.config.Get("requireBlankKeycard", true)) then
+            local hasBlankKeycard = false
+            for _, item in pairs(inventory:GetItemsByUniqueID("doorlock_keycard") or {}) do
+                local itemLockID = item:GetData("lockID", nil)
+                if (not itemLockID) then
+                    hasBlankKeycard = true
+                    break
+                end
+            end
+            
+            if (not hasBlankKeycard) then
+                client:Notify("You must have a blank keycard in your inventory to install a keycard lock.")
+                return
+            end
+        end
+        
+        -- For keycard mode, handle override code
+        if (overrideCode and overrideCode ~= "") then
+            options.overrideCodeHash = PLUGIN:HashCode(overrideCode)
+        end
     end
 
     -- Get first door for trace data (deadlocks need position)
@@ -888,6 +1024,22 @@ net.Receive("ixDoorLocks_ConfirmPlacement", function(_, client)
     -- Pass doorIDs to CreateLock
     options.doorIDs = doorIDs
     
+    -- Consume blank keycard if required for keycard mode
+    if (mode == PLUGIN.lockModes.KEYCARD and ix.config.Get("requireBlankKeycard", true)) then
+        local blankKeycard = nil
+        for _, item in pairs(inventory:GetItemsByUniqueID("doorlock_keycard") or {}) do
+            local itemLockID = item:GetData("lockID", nil)
+            if (not itemLockID) then
+                blankKeycard = item
+                break
+            end
+        end
+        
+        if (blankKeycard) then
+            blankKeycard:Remove()
+        end
+    end
+    
     local lockData, err = PLUGIN:CreateLock(client, firstDoor, lockType, mode, options)
     if (not lockData) then
         if (err == "alreadyHasLock") then
@@ -903,7 +1055,7 @@ net.Receive("ixDoorLocks_ConfirmPlacement", function(_, client)
         lockData.keycards = lockData.keycards or {}
         lockData.nextSerialNumber = lockData.nextSerialNumber or 1
 
-        if (#lockData.keycards < PLUGIN.config.maxKeycardsPerLock) then
+        if (#lockData.keycards < ix.config.Get("maxKeycardsPerLock", 10)) then
             local serial = lockData.nextSerialNumber
             lockData.nextSerialNumber = serial + 1
             local keyUID = tostring(util.CRC(lockData.lockID .. os.time() .. math.random()))
@@ -973,6 +1125,37 @@ function PLUGIN:PlayerUse(client, entity)
         -- Block door opening if the lock is actually locked
         if (isLocked) then
             return false
+        end
+        
+        -- Save door state when player opens/closes door (if retainDoorState is enabled)
+        if (lock.retainDoorState == true) then
+            -- Use multiple checks with increasing delays to catch the door state
+            -- This handles doors that open/close at different speeds, including slow blast doors
+            timer.Simple(0.3, function()
+                if (IsValid(entity) and entity:IsDoor()) then
+                    PLUGIN:SaveDoorStateForLock(lock.lockID, entity)
+                end
+            end)
+            timer.Simple(0.8, function()
+                if (IsValid(entity) and entity:IsDoor()) then
+                    PLUGIN:SaveDoorStateForLock(lock.lockID, entity)
+                end
+            end)
+            timer.Simple(1.5, function()
+                if (IsValid(entity) and entity:IsDoor()) then
+                    PLUGIN:SaveDoorStateForLock(lock.lockID, entity)
+                end
+            end)
+            timer.Simple(15, function()
+                if (IsValid(entity) and entity:IsDoor()) then
+                    PLUGIN:SaveDoorStateForLock(lock.lockID, entity)
+                end
+            end)
+            timer.Simple(30, function()
+                if (IsValid(entity) and entity:IsDoor()) then
+                    PLUGIN:SaveDoorStateForLock(lock.lockID, entity)
+                end
+            end)
         end
     end
 end
@@ -1813,6 +1996,32 @@ function PLUGIN:OpenLockMenu(client, door, lock, isDeadlock, isAdminDeactivated)
     end
     local admin = isAdmin(client)
 
+    -- Check if lock has override code (for keycard locks)
+    -- Check personal override code, or group override codes from any lock in the group
+    local hasOverrideCode = false
+    local overrideModeEnabled = true
+    local hasPersonalOverrideCode = false
+    local hasGroupOverrideCode = false
+    
+    if (lock.mode == self.lockModes.KEYCARD) then
+        overrideModeEnabled = lock.overrideModeEnabled ~= false -- Default to true if nil
+        
+        -- Check personal override code
+        hasPersonalOverrideCode = (lock.overrideCodeHash ~= nil)
+        
+        -- Check group override codes from all locks in the group
+        local groupLocks = self:GetAllGroupLocks(lock)
+        for _, groupLock in ipairs(groupLocks) do
+            if (groupLock.mode == self.lockModes.KEYCARD and groupLock.groupOverrideCodeHash) then
+                hasGroupOverrideCode = true
+                break
+            end
+        end
+        
+        -- Has override code if override mode is enabled AND (personal or group code exists)
+        hasOverrideCode = overrideModeEnabled and (hasPersonalOverrideCode or hasGroupOverrideCode)
+    end
+
     net.Start("ixDoorLocks_OpenMenu")
         net.WriteEntity(door)
         net.WriteString(lock.lockID or "")
@@ -1828,8 +2037,17 @@ function PLUGIN:OpenLockMenu(client, door, lock, isDeadlock, isAdminDeactivated)
         net.WriteBool(hasKeycard) -- Has valid keycard for keycard locks
         net.WriteBool(isKeycardMaster) -- Master tier keycard for keycard locks
         net.WriteBool(isKeycardManager) -- Manager or master tier keycard for keycard locks
+        net.WriteBool(hasOverrideCode) -- Whether lock has override code available
+        net.WriteBool(overrideModeEnabled) -- Override mode enabled state
+        net.WriteBool(hasPersonalOverrideCode) -- Whether personal override code exists
+        net.WriteBool(hasGroupOverrideCode) -- Whether group override code exists
         net.WriteBool(admin) -- Admin status
         net.WriteBool(isAdminDeactivated) -- Admin is deactivated (limited menu)
+        -- Get lock settings (defaults)
+        local autolockEnabled = lock.autolockEnabled ~= false -- Default to true
+        local retainDoorState = lock.retainDoorState == true -- Default to false
+        net.WriteBool(autolockEnabled) -- Autolock setting
+        net.WriteBool(retainDoorState) -- Retain door state setting
     net.Send(client)
 end
 
@@ -2012,7 +2230,7 @@ net.Receive("ixDoorLocks_DoAction", function(_, client)
         lock.keycards = lock.keycards or {}
         lock.nextSerialNumber = lock.nextSerialNumber or 1
 
-        if (#lock.keycards >= PLUGIN.config.maxKeycardsPerLock) then
+        if (#lock.keycards >= ix.config.Get("maxKeycardsPerLock", 10)) then
             client:Notify("This lock already has the maximum number of keycards.")
             return
         end
@@ -2085,65 +2303,32 @@ net.Receive("ixDoorLocks_DoAction", function(_, client)
             local inventory = char:GetInventory()
             if (not inventory) then return end
 
-            local hasCard = false
-            for _, item in pairs(inventory:GetItemsByUniqueID("doorlock_keycard") or {}) do
-                local lockIDItem = item:GetData("lockID", nil)
-                local keyUID = item:GetData("keyUID", nil)
-
-                if (lockIDItem == lock.lockID and keyUID) then
-                    for _, stored in ipairs(lock.keycards or {}) do
-                        local storedUID = (type(stored) == "table" and stored.keyUID) or stored
-                        if (storedUID == keyUID) then
-                            -- Check if card is active (if it's a table)
-                            if (type(stored) == "table" and stored.active) then
-                                hasCard = true
-                                break
-                            elseif (type(stored) == "string") then
-                                -- Old format, treat as active
-                                hasCard = true
-                                break
-                            end
-                        end
-                    end
-                end
-
-                if (hasCard) then break end
-            end
-
-            if (not hasCard) then
-                client:Notify("You must hold a valid keycard for this lock to print a new one.")
-                return
-            end
-
-            if (lock.isLocked) then
+            if (ix.config.Get("requireUnlockedDoorForPrinting", false) and lock.isLocked) then
                 client:Notify("Unlock the door before printing new keycards.")
                 return
             end
 
-            -- Check highest tier card held
+            -- Check highest tier card held (checks all locks in the same group)
             local highestTier = PLUGIN:GetHighestKeycardTier(client, lock)
             if (not highestTier or (highestTier ~= "master" and highestTier ~= "manager")) then
-                client:Notify("You must hold a master or manager keycard for this lock to print a new one.")
-                return
-            end
-
-            if (lock.isLocked) then
-                client:Notify("Unlock the door before printing new keycards.")
+                client:Notify("You must hold a master or manager keycard for this lock (or a lock in the same group) to print a new one.")
                 return
             end
 
             lock.keycards = lock.keycards or {}
             lock.nextSerialNumber = lock.nextSerialNumber or 1
 
-            if (#lock.keycards >= PLUGIN.config.maxKeycardsPerLock) then
+            if (#lock.keycards >= ix.config.Get("maxKeycardsPerLock", 10)) then
                 client:Notify("This lock already has the maximum number of keycards.")
                 return
             end
 
             -- Open UI to select card type and name
+            local door = PLUGIN:GetDoorFromID(lock.doorID)
             net.Start("ixDoorLocks_KeycardPrintMenu")
                 net.WriteString(lockID)
                 net.WriteBool(highestTier == "master") -- Can print master cards if holding master card
+                net.WriteEntity(door or NULL) -- Send door entity for trace line
             net.Send(client)
 
         end
@@ -2578,7 +2763,7 @@ end
         lock.keycards = lock.keycards or {}
         lock.nextSerialNumber = lock.nextSerialNumber or 1
 
-        if (#lock.keycards >= PLUGIN.config.maxKeycardsPerLock) then
+        if (#lock.keycards >= ix.config.Get("maxKeycardsPerLock", 10)) then
             client:Notify("This lock already has the maximum number of keycards.")
             return
         end
@@ -2628,8 +2813,51 @@ net.Receive("ixDoorLocks_SetGroupCode", function(_, client)
         end
     end
 
+    -- Store old group code to check if it changed
+    local oldGroupCode = lock.groupCode
+    
     -- Set group code
     lock.groupCode = (groupCode and groupCode ~= "") and groupCode or nil
+    
+    -- Handle group override code inheritance for keycard locks
+    if (lock.mode == PLUGIN.lockModes.KEYCARD) then
+        if (lock.groupCode and lock.groupCode ~= "") then
+            -- Lock is being added to a group - check if group has override code
+            local groupLocks = PLUGIN:GetAllGroupLocks(lock)
+            local foundGroupOverride = nil
+            
+            -- Look for group override code in other locks in the group
+            for _, groupLock in ipairs(groupLocks) do
+                if (groupLock ~= lock and groupLock.mode == PLUGIN.lockModes.KEYCARD and groupLock.groupOverrideCodeHash) then
+                    foundGroupOverride = groupLock.groupOverrideCodeHash
+                    break
+                end
+            end
+            
+            -- Inherit group override code if found, otherwise clear it
+            if (foundGroupOverride) then
+                lock.groupOverrideCodeHash = foundGroupOverride
+            else
+                lock.groupOverrideCodeHash = nil
+            end
+            
+            -- Handle pendingGroupOverride if it exists
+            if (lock.pendingGroupOverride) then
+                -- Apply pending group override to all locks in the group
+                for _, groupLock in ipairs(groupLocks) do
+                    if (groupLock.mode == PLUGIN.lockModes.KEYCARD) then
+                        groupLock.groupOverrideCodeHash = lock.pendingGroupOverride
+                    end
+                end
+                lock.pendingGroupOverride = nil
+            end
+        else
+            -- Group code cleared - clear group override code
+            lock.groupOverrideCodeHash = nil
+            lock.pendingGroupOverride = nil
+        end
+    end
+    
     PLUGIN:SaveData()
 
     if (lock.groupCode) then
@@ -2664,6 +2892,13 @@ net.Receive("ixDoorLocks_ClearGroupCode", function(_, client)
 
     -- Clear group code
     lock.groupCode = nil
+    
+    -- For keycard locks, also clear group override code when group code is cleared
+    if (lock.mode == PLUGIN.lockModes.KEYCARD) then
+        lock.groupOverrideCodeHash = nil
+        lock.pendingGroupOverride = nil
+    end
+    
     PLUGIN:SaveData()
 
     client:Notify("Group code cleared.")
@@ -2695,21 +2930,183 @@ net.Receive("ixDoorLocks_ViewGroupLocks", function(_, client)
     -- Get all locks in the same group
     local groupLocks = PLUGIN:GetAllGroupLocks(lock)
     
-    if (#groupLocks <= 1) then
-        client:Notify("This lock is not in a group.")
+    -- Send group management data to client (even if only one lock, so UI can show "not in a group")
+    local groupCode = lock.groupCode or ""
+    local door = PLUGIN:GetDoorFromID(lock.doorID)
+    net.Start("ixDoorLocks_GroupManagementData")
+        net.WriteEntity(door) -- Send door entity for reopening config menu
+        net.WriteString(lockID)
+        net.WriteString(groupCode)
+        net.WriteUInt(#groupLocks, 8)
+        for _, groupLock in ipairs(groupLocks) do
+            local groupDoor = PLUGIN:GetDoorFromID(groupLock.doorID)
+            local doorName = IsValid(groupDoor) and groupDoor:GetClass() or "Unknown"
+            net.WriteString(groupLock.lockID)
+            net.WriteString(groupLock.mode or "")
+            net.WriteString(doorName)
+        end
+    net.Send(client)
+end)
+
+-- Change Personal Override Code handler
+net.Receive("ixDoorLocks_ChangePersonalOverrideCode", function(_, client)
+    if (not IsValid(client) or not client:GetCharacter()) then return end
+
+    local lockID = net.ReadString()
+    local newCode = net.ReadString() or ""
+
+    local lock = PLUGIN:GetLock(lockID)
+    if (not lock or lock.mode ~= PLUGIN.lockModes.KEYCARD) then return end
+
+    -- Only master keycard holders can change override codes
+    local highestTier = PLUGIN:GetHighestKeycardTier(client, lock)
+    if (highestTier ~= "master") then
+        client:Notify("You must be a master keycard holder to change override codes.")
         return
     end
 
-    -- Build list of lock info
-    local lockInfo = {}
-    for _, groupLock in ipairs(groupLocks) do
-        local door = PLUGIN:GetDoorFromID(groupLock.doorID)
-        local doorName = IsValid(door) and door:GetClass() or "Unknown"
-        table.insert(lockInfo, string.format("Lock %s (%s) - Door: %s", groupLock.lockID, groupLock.mode, doorName))
+    if (newCode == "") then
+        -- Clear the override code
+        lock.overrideCodeHash = nil
+        PLUGIN:SaveData()
+        client:Notify("Personal override code cleared.")
+        return
     end
 
-    client:Notify(string.format("Group locks (%d total):\n%s", #groupLocks, table.concat(lockInfo, "\n")))
+    -- Set new override code
+    lock.overrideCodeHash = PLUGIN:HashCode(newCode)
+    PLUGIN:SaveData()
+    client:Notify("Personal override code updated.")
 end)
+
+-- Change Group Override Code handler
+net.Receive("ixDoorLocks_ChangeGroupOverrideCode", function(_, client)
+    if (not IsValid(client) or not client:GetCharacter()) then return end
+
+    local lockID = net.ReadString()
+    local newCode = net.ReadString() or ""
+
+    local lock = PLUGIN:GetLock(lockID)
+    if (not lock or lock.mode ~= PLUGIN.lockModes.KEYCARD) then return end
+
+    -- Only master keycard holders can change group override codes
+    local highestTier = PLUGIN:GetHighestKeycardTier(client, lock)
+    if (highestTier ~= "master") then
+        client:Notify("You must be a master keycard holder to change group override codes.")
+        return
+    end
+
+    -- Get all locks in the group
+    local groupLocks = PLUGIN:GetAllGroupLocks(lock)
+    
+    if (newCode == "") then
+        -- Clear group override code for all locks in the group
+        for _, groupLock in ipairs(groupLocks) do
+            if (groupLock.mode == PLUGIN.lockModes.KEYCARD) then
+                groupLock.groupOverrideCodeHash = nil
+            end
+        end
+        PLUGIN:SaveData()
+        client:Notify("Group override code cleared for all locks in the group.")
+        return
+    end
+
+    -- Set group override code for all keycard locks in the group
+    local newCodeHash = PLUGIN:HashCode(newCode)
+    for _, groupLock in ipairs(groupLocks) do
+        if (groupLock.mode == PLUGIN.lockModes.KEYCARD) then
+            groupLock.groupOverrideCodeHash = newCodeHash
+            -- Enable override mode if it was disabled
+            if (groupLock.overrideModeEnabled == false) then
+                groupLock.overrideModeEnabled = true
+            end
+        end
+    end
+    PLUGIN:SaveData()
+    client:Notify("Group override code updated for all locks in the group.")
+end)
+
+-- Toggle Override Mode handler
+net.Receive("ixDoorLocks_ToggleOverrideMode", function(_, client)
+    if (not IsValid(client) or not client:GetCharacter()) then return end
+
+    local lockID = net.ReadString()
+
+    local lock = PLUGIN:GetLock(lockID)
+    if (not lock or lock.mode ~= PLUGIN.lockModes.KEYCARD) then return end
+
+    -- Only master keycard holders can toggle override mode
+    local highestTier = PLUGIN:GetHighestKeycardTier(client, lock)
+    if (highestTier ~= "master") then
+        client:Notify("You must be a master keycard holder to toggle override mode.")
+        return
+    end
+
+    -- Toggle override mode (default to true if nil)
+    local currentState = lock.overrideModeEnabled ~= false
+    lock.overrideModeEnabled = not currentState
+    PLUGIN:SaveData()
+    
+    if (lock.overrideModeEnabled) then
+        client:Notify("Override mode enabled.")
+    else
+        client:Notify("Override mode disabled.")
+    end
+end)
+
+-- Submit Override Code handler (for unlocking/locking with override code)
+net.Receive("ixDoorLocks_SubmitOverrideCode", function(_, client)
+    if (not IsValid(client) or not client:GetCharacter()) then return end
+
+    local lockID = net.ReadString()
+    local action = net.ReadString() -- "lock" or "unlock"
+    local code = net.ReadString() or ""
+
+    local lock = PLUGIN:GetLock(lockID)
+    if (not lock or lock.mode ~= PLUGIN.lockModes.KEYCARD) then return end
+
+    -- Check if override mode is enabled
+    if (lock.overrideModeEnabled == false) then
+        client:Notify("Override mode is disabled for this lock.")
+        return
+    end
+
+    -- Check override code (personal or group)
+    local codeHash = PLUGIN:HashCode(code)
+    local isValid = false
+    
+    -- Check personal override code
+    if (lock.overrideCodeHash and lock.overrideCodeHash == codeHash) then
+        isValid = true
+    end
+    
+    -- Check group override code (from any lock in the group)
+    if (not isValid) then
+        local groupLocks = PLUGIN:GetAllGroupLocks(lock)
+        for _, groupLock in ipairs(groupLocks) do
+            if (groupLock.mode == PLUGIN.lockModes.KEYCARD and groupLock.groupOverrideCodeHash and groupLock.groupOverrideCodeHash == codeHash) then
+                isValid = true
+                break
+            end
+        end
+    end
+    
+    if (not isValid) then
+        client:Notify("Invalid override code.")
+        return
+    end
+
+    -- Perform the lock/unlock action
+    if (action == "unlock") then
+        PLUGIN:SetLockState(lockID, false)
+        client:Notify("Lock unlocked with override code.")
+    elseif (action == "lock") then
+        PLUGIN:SetLockState(lockID, true)
+        client:Notify("Lock locked with override code.")
+    end
+end)
+
+-- View Group Locks handler (legacy - now sends GroupManagementData)
 
 -- Simple admin helpers ------------------------------------------------------
 
@@ -3097,6 +3494,23 @@ net.Receive("ixDoorLocks_KeycardPrintConfirm", function(_, client)
     local inventory = char:GetInventory()
     if (not inventory) then return end
 
+    -- Check for blank keycard if required
+    if (ix.config.Get("requireBlankKeycard", true)) then
+        local hasBlankKeycard = false
+        for _, item in pairs(inventory:GetItemsByUniqueID("doorlock_keycard") or {}) do
+            local itemLockID = item:GetData("lockID", nil)
+            if (not itemLockID) then
+                hasBlankKeycard = true
+                break
+            end
+        end
+        
+        if (not hasBlankKeycard) then
+            client:Notify("You must have a blank keycard in your inventory to print new keycards.")
+            return
+        end
+    end
+
     -- Check highest tier card held
     local highestTier = PLUGIN:GetHighestKeycardTier(client, lock)
     if (not highestTier or (highestTier ~= "master" and highestTier ~= "manager")) then
@@ -3121,7 +3535,7 @@ net.Receive("ixDoorLocks_KeycardPrintConfirm", function(_, client)
         return
     end
 
-    if (lock.isLocked) then
+    if (ix.config.Get("requireUnlockedDoorForPrinting", false) and lock.isLocked) then
         client:Notify("Unlock the door before printing new keycards.")
         return
     end
@@ -3129,7 +3543,7 @@ net.Receive("ixDoorLocks_KeycardPrintConfirm", function(_, client)
     lock.keycards = lock.keycards or {}
     lock.nextSerialNumber = lock.nextSerialNumber or 1
 
-    if (#lock.keycards >= PLUGIN.config.maxKeycardsPerLock) then
+    if (#lock.keycards >= ix.config.Get("maxKeycardsPerLock", 10)) then
         client:Notify("This lock already has the maximum number of keycards.")
         return
     end
@@ -3145,6 +3559,22 @@ net.Receive("ixDoorLocks_KeycardPrintConfirm", function(_, client)
         cardName = cardName or "", -- Store as-is, empty string if not provided
         active = true
     })
+
+    -- Consume blank keycard if required
+    if (ix.config.Get("requireBlankKeycard", true)) then
+        local blankKeycard = nil
+        for _, item in pairs(inventory:GetItemsByUniqueID("doorlock_keycard") or {}) do
+            local itemLockID = item:GetData("lockID", nil)
+            if (not itemLockID) then
+                blankKeycard = item
+                break
+            end
+        end
+        
+        if (blankKeycard) then
+            blankKeycard:Remove()
+        end
+    end
 
     if (inventory:Add("doorlock_keycard", 1, {
         lockID = lock.lockID,
@@ -3255,6 +3685,45 @@ net.Receive("ixDoorLocks_KeycardManage", function(_, client)
         
         -- Refresh the keycard list (use the original lock for the refresh)
         PLUGIN:RefreshKeycardList(client, lock)
+    elseif (action == "delete") then
+        -- Get the keyUID of the card being used to perform the action
+        local userKeyUID = PLUGIN:GetPlayerKeycardUID(client, lock)
+        
+        -- Prevent deleting your own card
+        if (userKeyUID == keyUID) then
+            client:Notify("Cannot delete your own keycard.")
+            return
+        end
+        
+        -- Only masters can delete keycards
+        if (highestTier ~= "master") then
+            client:Notify("Only master keycard holders can delete keycards.")
+            return
+        end
+        
+        -- Cannot delete group cards (cards from other locks in the group)
+        -- This is checked client-side, but verify server-side as well
+        if (targetLock.lockID ~= lock.lockID) then
+            client:Notify("Cannot delete keycards from other locks in the group.")
+            return
+        end
+        
+        -- Only masters can delete other masters or managers
+        if (cardType == "master" or cardType == "manager") then
+            if (highestTier ~= "master") then
+                client:Notify("Only master keycard holders can delete master or manager keycards.")
+                return
+            end
+        end
+        
+        -- Remove the keycard from the array
+        table.remove(targetLock.keycards, cardIndex)
+        PLUGIN:SaveData()
+
+        client:Notify("Keycard permanently deleted.")
+        
+        -- Refresh the keycard list (use the original lock for the refresh)
+        PLUGIN:RefreshKeycardList(client, lock)
     end
 end)
 
@@ -3287,7 +3756,7 @@ net.Receive("ixDoorLocks_KeycardStoryConfirm", function(_, client)
     lock.keycards = lock.keycards or {}
     lock.nextSerialNumber = lock.nextSerialNumber or 1
 
-    if (#lock.keycards >= PLUGIN.config.maxKeycardsPerLock) then
+    if (#lock.keycards >= ix.config.Get("maxKeycardsPerLock", 10)) then
         client:Notify("This lock already has the maximum number of keycards.")
         return
     end
@@ -3364,6 +3833,265 @@ net.Receive("ixDoorLocks_KeycardStoryConfirm", function(_, client)
     PLUGIN:SaveData()
 
     client:Notify("Story card printed: " .. storyData.name)
+end)
+
+-- Knock-to-Toggle functionality ---------------------------------------------------------
+-- When a player knocks on a door with their hands, simulate clicking the lock/unlock button
+
+hook.Add("CanPlayerKnock", "ixDoorLocks_KnockToToggle", function(client, entity)
+    if (not IsValid(client) or not IsValid(entity) or not entity:IsDoor()) then
+        return -- Allow normal knock behavior
+    end
+    
+    if (not PLUGIN or not PLUGIN.GetDoorLock) then
+        return -- Locksystem not loaded
+    end
+    
+    -- Check for both digilock and deadlock
+    local lock = PLUGIN:GetDoorLock(entity, PLUGIN.lockTypes.DIGILOCK)
+    if (not lock) then
+        lock = PLUGIN:GetDoorLock(entity, PLUGIN.lockTypes.DEADLOCK)
+    end
+    
+    if (not lock) then
+        return -- No locksystem lock, allow normal knock
+    end
+    
+    local mode = lock.mode
+    local isLocked = lock.isLocked and true or false
+    
+    -- Check if user has access to toggle this lock (admins must follow same rules)
+    local hasAccess = false
+    
+    if (mode == PLUGIN.lockModes.CODE) then
+        -- For code locks: need manager or master access to toggle directly
+        local hasManager = PLUGIN:HasManagerAccess(client, lock)
+        local hasMaster = PLUGIN:HasMasterAccess(client, lock)
+        
+        if (isLocked) then
+            -- If locked, need manager/master to unlock directly, otherwise need code entry
+            if (hasManager or hasMaster) then
+                hasAccess = true
+            else
+                -- User needs to enter code - open code entry UI
+                net.Start("ixDoorLocks_OpenCodeEntry")
+                    net.WriteEntity(entity)
+                    net.WriteString(lock.lockID)
+                net.Send(client)
+                return false -- Prevent normal knock
+            end
+        else
+            -- If unlocked, anyone can lock a code lock
+            hasAccess = true
+        end
+    elseif (mode == PLUGIN.lockModes.KEYCARD) then
+        -- For keycard locks: need a valid active keycard
+        local char = client:GetCharacter()
+        if (char) then
+            local inventory = char:GetInventory()
+            if (inventory) then
+                local groupLocks = PLUGIN:GetAllGroupLocks(lock)
+                for _, item in pairs(inventory:GetItemsByUniqueID("doorlock_keycard") or {}) do
+                    local itemLockID = item:GetData("lockID", nil)
+                    local keyUID = item:GetData("keyUID", nil)
+                    
+                    for _, groupLock in ipairs(groupLocks) do
+                        if (itemLockID == groupLock.lockID and keyUID) then
+                            for _, cardData in ipairs(groupLock.keycards or {}) do
+                                local storedUID = (type(cardData) == "table" and cardData.keyUID) or cardData
+                                if (storedUID == keyUID) then
+                                    if (type(cardData) == "table" and cardData.active) then
+                                        hasAccess = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if (hasAccess) then break end
+                    end
+                    if (hasAccess) then break end
+                end
+            end
+        end
+        
+        -- If no keycard, check for override code
+        if (not hasAccess) then
+            local hasOverrideCode = false
+            local overrideModeEnabled = lock.overrideModeEnabled ~= false
+            if (overrideModeEnabled) then
+                if (lock.overrideCodeHash ~= nil) then
+                    hasOverrideCode = true
+                end
+                if (not hasOverrideCode) then
+                    local groupLocks = PLUGIN:GetAllGroupLocks(lock)
+                    for _, groupLock in ipairs(groupLocks) do
+                        if (groupLock.mode == PLUGIN.lockModes.KEYCARD and groupLock.groupOverrideCodeHash) then
+                            hasOverrideCode = true
+                            break
+                        end
+                    end
+                end
+            end
+            
+            if (hasOverrideCode and overrideModeEnabled) then
+                -- User needs to enter override code - open override code UI
+                net.Start("ixDoorLocks_OpenOverrideCodeEntry")
+                    net.WriteEntity(entity)
+                    net.WriteString(lock.lockID)
+                    net.WriteBool(isLocked)
+                net.Send(client)
+                return false -- Prevent normal knock
+            end
+        end
+    elseif (mode == PLUGIN.lockModes.BIOMETRIC) then
+        -- For biometric locks: need to be authorized
+        hasAccess = PLUGIN:IsBiometricAuthorized(client, lock) or PLUGIN:HasMasterAccess(client, lock)
+    end
+    
+    -- If user doesn't have access, allow normal knock
+    if (not hasAccess) then
+        return -- Allow normal knock behavior
+    end
+    
+    -- User has access, simulate clicking the toggle button
+    PLUGIN:HandleToggleLock(client, lock)
+    
+    -- Prevent normal knock behavior since we're toggling the lock instead
+    return false
+end)
+
+-- Helper function to save door state for all doors in a lock
+-- Saves the state from the door that changed, but does NOT apply it to other doors immediately
+-- The saved state will be restored on server restart/map load
+function PLUGIN:SaveDoorStateForLock(lockID, doorThatChanged)
+    local lock = self:GetLock(lockID)
+    if (not lock or lock.retainDoorState ~= true) then return end
+    
+    local doorIDs = lock.doorIDs or {lock.doorID}
+    local doorStates = lock.doorStates or {}
+    
+    -- Determine the state from the door that changed (or first door if none specified)
+    local referenceDoor = doorThatChanged
+    if (not IsValid(referenceDoor)) then
+        local firstDoorID = doorIDs[1]
+        referenceDoor = self:GetDoorFromID(firstDoorID)
+    end
+    
+    if (not IsValid(referenceDoor) or not referenceDoor:IsDoor()) then return end
+    
+    -- Check door state - try multiple reliable methods
+    local isOpen = false
+    
+    -- Method 1: Check internal door state variable (most reliable)
+    local doorState = referenceDoor:GetInternalVariable("m_eDoorState")
+    if (doorState ~= nil) then
+        -- Door states: 0 = fully open, 1 = fully closed, 2 = opening, 3 = closing
+        isOpen = (doorState == 0 or doorState == 2)
+    else
+        -- Method 2: Try alternative internal variable names
+        doorState = referenceDoor:GetInternalVariable("m_iState")
+        if (doorState ~= nil) then
+            isOpen = (doorState == 0 or doorState == 2)
+        else
+            -- Method 3: Check door speed (if moving, likely opening if positive)
+            local speed = referenceDoor:GetInternalVariable("m_flSpeed")
+            if (speed and speed > 0) then
+                isOpen = true -- Door is moving forward, likely opening
+            elseif (speed and speed < 0) then
+                isOpen = false -- Door is moving backward, likely closing
+            else
+                -- Method 4: Try to detect by checking if door is at its closed position
+                -- This is a fallback - we'll check the door's current position
+                -- Most doors rotate or move when opening, so we can compare positions
+                -- However, this requires knowing the closed position, which we might not have
+                -- For now, if we can't determine, we'll log it and default to closed
+                print("[ixDoorLocks] Warning: Could not determine door state for door " .. tostring(referenceDoor:EntIndex()) .. " (lockID: " .. tostring(lockID) .. ")")
+                print("[ixDoorLocks] Door entity: " .. tostring(referenceDoor))
+                print("[ixDoorLocks] Door class: " .. tostring(referenceDoor:GetClass()))
+                -- Default to closed if we can't determine (safer than assuming open)
+                isOpen = false
+            end
+        end
+    end
+    
+    local targetState = isOpen and "open" or "close"
+    print("[ixDoorLocks] Saving door state for lock " .. tostring(lockID) .. ": " .. targetState .. " (doorState var: " .. tostring(doorState) .. ")")
+    
+    -- Save the same state for all doors in the lock (for restoration on restart/load)
+    -- This ensures all doors in a lock group will restore to the same state
+    for _, doorID in ipairs(doorIDs) do
+        doorStates[doorID] = targetState
+    end
+    
+    lock.doorStates = doorStates
+    self:SaveData()
+    -- Note: We do NOT apply the state to other doors immediately - only save it
+    -- The saved state will be restored when the server restarts or map loads
+end
+
+-- Net message handlers for lock settings
+net.Receive("ixDoorLocks_ToggleAutolock", function(_, client)
+    if (not IsValid(client) or not client:GetCharacter()) then return end
+    
+    local lockID = net.ReadString()
+    local lock = PLUGIN:GetLock(lockID)
+    if (not lock) then return end
+    
+    -- Only master/installer can change settings
+    if (not PLUGIN:HasMasterAccess(client, lock)) then
+        client:Notify("Only the lock installer can change lock settings.")
+        return
+    end
+    
+    -- Toggle autolock (defaults to true)
+    lock.autolockEnabled = not (lock.autolockEnabled ~= false)
+    
+    -- If disabling autolock, remove any existing timer
+    if (not lock.autolockEnabled and lock.autoRelockTimer) then
+        timer.Remove(lock.autoRelockTimer)
+        lock.autoRelockTimer = nil
+    end
+    
+    -- If enabling autolock and lock is unlocked, start timer
+    if (lock.autolockEnabled and not lock.isLocked) then
+        if (lock.autoRelockTimer) then
+            timer.Remove(lock.autoRelockTimer)
+        end
+        lock.autoRelockTimer = "ixDoorLocks_AutoRelock_" .. lockID
+        timer.Create(lock.autoRelockTimer, 60, 1, function()
+            if (not ix.shuttingDown and lock and not lock.isLocked) then
+                PLUGIN:SetLockState(lockID, true)
+            end
+        end)
+    end
+    
+    PLUGIN:SaveData()
+    client:Notify("Autolock " .. (lock.autolockEnabled and "enabled" or "disabled") .. ".")
+end)
+
+net.Receive("ixDoorLocks_ToggleRetainDoorState", function(_, client)
+    if (not IsValid(client) or not client:GetCharacter()) then return end
+    
+    local lockID = net.ReadString()
+    local lock = PLUGIN:GetLock(lockID)
+    if (not lock) then return end
+    
+    -- Only master/installer can change settings
+    if (not PLUGIN:HasMasterAccess(client, lock)) then
+        client:Notify("Only the lock installer can change lock settings.")
+        return
+    end
+    
+    -- Toggle retainDoorState (defaults to false)
+    lock.retainDoorState = not (lock.retainDoorState == true)
+    
+    -- If enabling, save current door states
+    if (lock.retainDoorState) then
+        PLUGIN:SaveDoorStateForLock(lockID)
+    end
+    
+    PLUGIN:SaveData()
+    client:Notify("Retain Door State " .. (lock.retainDoorState and "enabled" or "disabled") .. ".")
 end)
 
 

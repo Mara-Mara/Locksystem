@@ -1,6 +1,6 @@
-ITEM.name = "Doorlock Keycard"
-ITEM.description = "An encoded keycard used with a specific digital lock."
-ITEM.model = "models/eternalis/items/keys/elem_key.mdl"
+ITEM.name = "Keycard"
+ITEM.description = "A keycard meant for use with a specific digitized locking system."
+ITEM.model = "models/eternalis/items/cards/access_card.mdl"
 ITEM.skin = 5 -- Default blank skin
 ITEM.width = 1
 ITEM.height = 1
@@ -16,9 +16,9 @@ function ITEM:GetModel()
         return "models/eternalis/items/keys/elem_key.mdl"
     end
     
-    -- Blank cards use elem_key with skin 5
+    -- Blank cards use access_card model
     if (not cardType) then
-        return "models/eternalis/items/keys/elem_key.mdl"
+        return "models/eternalis/items/cards/access_card.mdl"
     end
     
     -- Set model based on card type
@@ -50,9 +50,9 @@ function ITEM:GetSkin()
         return 4
     end
     
-    -- Blank cards use skin 5
+    -- Blank cards don't use skins
     if (not cardType) then
-        return 5
+        return 0
     end
     
     -- Regular cards don't use skins
@@ -65,7 +65,7 @@ function ITEM:GetName()
     local cardName = self:GetData("cardName", nil)
 
     if (not lockID) then
-        return self.name .. " (Blank)"
+        return "Keycard"
     end
 
     if (serialNumber) then
@@ -88,7 +88,7 @@ function ITEM:GetDescription()
     local storyDescription = self:GetData("storyDescription", nil)
 
     if (not lockID) then
-        return "A blank keycard that has not yet been encoded."
+        return "A keycard meant for use with a specific digitized locking system."
     end
 
     -- Story cards use their custom description
